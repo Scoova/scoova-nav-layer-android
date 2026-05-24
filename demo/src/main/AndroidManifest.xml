@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Foreground service for live navigation: keeps GPS + TTS alive
+         when the screen is off or the user switches apps. Android 14+
+         requires the typed FOREGROUND_SERVICE_LOCATION permission in
+         addition to the legacy FOREGROUND_SERVICE one.
+
+         IMPORTANT: we deliberately do NOT request ACCESS_BACKGROUND_LOCATION.
+         Google Play heavily scrutinises that permission (frequent rejections
+         even with good justification). The foreground-service-with-type=
+         "location" pattern keeps GPS flowing while the screen is off / app
+         is backgrounded without ever touching background-location. The
+         explicit `tools:node="remove"` below strips it back out in case
+         a transitive dependency (play-services-location) tries to merge
+         it in. Pattern proven by scoova_app. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission
+        android:name="android.permission.ACCESS_BACKGROUND_LOCATION"
+        tools:node="remove" />
+
+    <application
+        android:name=".ScoovaRideApp"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.ScoovaRide"
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".RideActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Sticky notification + GPS/TTS keepalive during an active ride.
+             foregroundServiceType="location" is mandatory on Android 14+
+             when the service requests location updates. -->
+        <service
+            android:name=".NavigationService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+    </application>
+</manifest>
