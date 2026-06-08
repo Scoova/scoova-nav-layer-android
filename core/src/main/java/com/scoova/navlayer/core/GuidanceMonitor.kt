@@ -116,6 +116,19 @@ public class GuidanceMonitor {
     private var latestMetersRemaining: Int = 0
     private var metersRemainingAtSpoke: Int = 0
 
+    /** Highest "distance covered along the route" the rider has reached
+     *  this trip, in metres. Used to gate the standstill wrong-way
+     *  check: if the rider hasn't moved past [movedThresholdMeters]
+     *  yet — they're still at the start — the compass-mismatch alarm
+     *  is suppressed. Without this, riders with a stuck/uncalibrated
+     *  compass (every emulator + indoor electrical interference) hear
+     *  "Wrong way, please turn around" three seconds after picking a
+     *  route, while the puck has never moved. iOS doesn't trip on
+     *  this because real iPhone compasses self-calibrate; on Android
+     *  we need the explicit gate. */
+    private var maxProgressedMeters: Double = 0.0
+    private val movedThresholdMeters: Double = 15.0
+
     /** Adapter calls this once per route load. */
     public fun setRoute(routeShape: List<DoubleArray>) {
         this.shape = routeShape
@@ -142,6 +155,7 @@ public class GuidanceMonitor {
         headingMismatchStartedAt = 0
         latestMetersRemaining = 0
         metersRemainingAtSpoke = 0
+        maxProgressedMeters = 0.0
     }
 
     /** Called by NavLayer every time it actually speaks a cue. Resets
@@ -182,6 +196,15 @@ public class GuidanceMonitor {
 
         // Track for the speed-aware keep-going arm below.
         latestMetersRemaining = p.metersRemaining
+
+        // Track how far the rider has progressed along the polyline.
+        // The gate at the wrong-way standstill check below uses this
+        // to suppress the alarm until the rider has actually moved.
+        // Without this, a stuck/uncalibrated compass at route start
+        // fires "Wrong way, please turn around" while the puck has
+        // never moved — exact bug the rider hit on the emulator.
+        val progressedNow = proj.progressM
+        if (progressedNow > maxProgressedMeters) maxProgressedMeters = progressedNow
 
         val events = mutableListOf<GuidanceEvent>()
 
@@ -257,7 +280,16 @@ public class GuidanceMonitor {
         // detection (lateral offset) covers the real case.
         val compass = compassHeadingDeg
         val speed = p.speedMps
-        if (!phoneInPocket && compass != null &&
+        // Additional gate: don't fire wrong-way until the rider has
+        // actually moved past [movedThresholdMeters] along the route.
+        // At route start a stationary rider's compass routinely
+        // disagrees with the polyline bearing — emulator (fake 0°
+        // compass), indoor magnetic interference, fabric pockets
+        // turned the wrong way. iOS' real iPhone compass self-
+        // calibrates so iOS doesn't hit this; Android needs the
+        // explicit gate.
+        val riderHasMoved = maxProgressedMeters >= movedThresholdMeters
+        if (!phoneInPocket && riderHasMoved && compass != null &&
             (speed == null || speed < maxSpeedForHeadingCheckMps)) {
             val mismatchDeg = angleDeltaAbs(compass, proj.segmentBearingDeg)
             if (mismatchDeg > headingMismatchDeg) {

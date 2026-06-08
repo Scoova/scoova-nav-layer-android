@@ -87,6 +87,22 @@ public class ScoovaNavLayer private constructor(
         pocketDetector.phoneInPocket
 
     private var maneuvers: List<ManeuverEvent> = emptyList()
+    /** Current route polyline (mirrors iOS' `shape`). Cached so the
+     *  [GuidanceReasoner] can project the rider onto the line every
+     *  tick without re-decoding. Set in [setRouteShape]. */
+    private var routeShape: List<DoubleArray> = emptyList()
+    /** Server-emitted per-route corridor (cross-streets, ordinals,
+     *  graph fingerprints, neighbour graph). Null on legacy responses;
+     *  reasoner then falls back to lateral-distance heuristics. */
+    private var corridor: Corridor? = null
+    /** Latest reasoner output — published so the host can bind a HUD
+     *  to it, and consumed internally by the off-route / reroute path. */
+    private val _liveGuidance = MutableStateFlow<LiveGuidanceState?>(null)
+    public val liveGuidance: StateFlow<LiveGuidanceState?> = _liveGuidance.asStateFlow()
+    /** Per-cue telemetry stream — every utterance fires a [CueEvent]
+     *  the host can pipe into [CueTelemetrySender] or its own analytics. */
+    private val _cueEvents = MutableSharedFlow<CueEvent>(extraBufferCapacity = 16)
+    public val cueEvents: SharedFlow<CueEvent> = _cueEvents.asSharedFlow()
     /** Per-maneuver cue track — the "subtitles", a 1:1 mirror of the
      *  iOS engine. Built on [onRoute]; fired once-each from [onProgress]. */
     private var cueSchedule: Map<Int, List<CuePoint>> = emptyMap()
@@ -235,6 +251,44 @@ public class ScoovaNavLayer private constructor(
      *  comparison fails — never speak the welcome more than once per
      *  60 s window. */
     private var lastWelcomedAtMs: Long = 0L
+
+    /**
+     * Host callback fired when the SDK decides a reroute is needed
+     * (OffRoute, WrongWayHeading, or MissedTurn event past throttle).
+     * The host's routing adapter listens and refetches the route from
+     * the rider's current location to the memoised destination. iOS
+     * parity for `onRerouteNeeded` on ScoovaNavLayer.swift.
+     */
+    public var onRerouteNeeded: (() -> Unit)? = null
+
+    /**
+     * Host callback fired after a route lands in [setRouteShape] —
+     * both initial routes and reroutes. Carries the new polyline so
+     * the host UI can update its GeoJSON / camera fit. iOS parity for
+     * `onRouteRefreshed` on ScoovaNavLayer.swift.
+     */
+    public var onRouteRefreshed: ((List<DoubleArray>) -> Unit)? = null
+
+    /**
+     * Wall-clock of the last reroute we requested. Used together with
+     * [lastRerouteLandedAtMs] to throttle reroute fetches — without
+     * this, every off-route tick fires a new HTTP request and the
+     * rider gets a "Recalculating" cue every 250 ms. iOS uses the
+     * same fields with identical millis.
+     */
+    private var rerouteRequestedAtMs: Long = 0
+    /** Wall-clock of the last reroute response. Adapter calls
+     *  [onRouteLanded] when its startRoute completes. */
+    private var lastRerouteLandedAtMs: Long = 0
+    private val rerouteFetchThrottleMs: Long = 8_000
+    private val rerouteCueCooldownMs: Long = 10_000
+
+    /** Adapter calls this on every successful route fetch (initial OR
+     *  reroute) so [rerouteRequestedAtMs] / [lastRerouteLandedAtMs]
+     *  throttling stays accurate. iOS adapter calls the equivalent. */
+    public fun onRouteLanded() {
+        lastRerouteLandedAtMs = System.currentTimeMillis()
+    }
 
     /**
      * Per-route record of which maneuvers have had ANY voice cue
@@ -450,7 +504,34 @@ public class ScoovaNavLayer private constructor(
 
     /** Adapter calls this once when the host SDK gives us the route. */
     public fun onRoute(maneuvers: List<ManeuverEvent>) {
+        onRoute(maneuvers, isReroute = false, eyesOff = false)
+    }
+
+    /**
+     * Adapter-facing overload that distinguishes initial routes from
+     * mid-trip reroutes. iOS parity for `onRoute(maneuvers, isReroute,
+     * eyesOff)` on ScoovaNavLayer.swift. When `isReroute == true` the
+     * welcome cue is suppressed (rider doesn't want to hear "Let's
+     * go" again three minutes into their trip), the eyes-off voice
+     * mode flag is propagated to the cue grammar, and the throttle
+     * timestamp updates so the next reroute respects the cooldown.
+     */
+    public fun onRoute(
+        maneuvers: List<ManeuverEvent>,
+        isReroute: Boolean,
+        eyesOff: Boolean = false,
+    ) {
         this.maneuvers = maneuvers
+        // On reroute, lock the welcome hash to the current maneuver
+        // list so the welcome can't refire. The hash-comparison block
+        // below would otherwise reset welcomedRouteHash whenever the
+        // new maneuver sequence differs from the last one — which is
+        // the whole point of a reroute, so it would always fire the
+        // welcome again without this guard.
+        if (isReroute) {
+            welcomedRouteHash = maneuvers.hashCode()
+            lastWelcomedAtMs = System.currentTimeMillis()
+        }
         // Only re-arm the welcome cue when the route is materially
         // different from the last one we welcomed. A re-rate that
         // produces the same maneuver sequence (off-route flap on a
@@ -483,7 +564,7 @@ public class ScoovaNavLayer private constructor(
         // re-arms the arrival cue for the new leg.)
         _arrived.value = false
         stoppedNearDestSinceMs = 0L
-        eyesOff.setManeuvers(maneuvers)
+        this.eyesOff.setManeuvers(maneuvers)
         guidance.reset()
     }
 
@@ -497,8 +578,26 @@ public class ScoovaNavLayer private constructor(
      * would correctly call "off route."
      */
     public fun setRouteShape(shape: List<DoubleArray>) {
+        routeShape = shape
         guidance.setRoute(shape)
         guidance.setCosting(profile)
+        // Notify the host so the UI can redraw the polyline after a
+        // reroute — without this the rider's map stays on the OLD
+        // shape after an auto-reroute lands. iOS' onRouteRefreshed
+        // callback handles the same. Initial-route hosts can ignore
+        // the call (they already drew the shape from startRoute's
+        // return value); reroute hosts NEED it.
+        runCatching { onRouteRefreshed?.invoke(shape) }
+    }
+
+    /**
+     * Adapter sets the decoded per-route corridor block. Call once per
+     * route, ideally right after [onRoute] / [setRouteShape]. Null is
+     * the legacy-server path (no corridor → reasoner falls back to
+     * lateral-distance heuristics). Mirrors iOS' `onCorridor`.
+     */
+    public fun onCorridor(corridor: Corridor?) {
+        this.corridor = corridor
     }
 
     /** Adapter calls this on every host-SDK route-progress update (1-4 Hz). */
@@ -574,8 +673,21 @@ public class ScoovaNavLayer private constructor(
             }
             saySpoken(phrase, CueTone.Calm)
         }
+        // ── Guidance reasoner ────────────────────────────────────────
+        // Produce the unit-of-reasoning the rest of this tick reads
+        // against: rider's snapped way, on-route signal, upcoming
+        // decision + ordinal/ambiguity context. When the corridor is
+        // missing (legacy server) the reasoner degrades gracefully.
+        _liveGuidance.value = GuidanceReasoner.reason(
+            p = p,
+            route = maneuvers,
+            corridor = corridor,
+            shape = routeShape,
+        )
+
         val idx = p.upcomingManeuverIndex.coerceIn(0, maneuvers.lastIndex)
         val maneuver = maneuvers[idx]
+        latestManeuverIndexForTelemetry = idx
         // Per-maneuver thresholds from the server (farMeters / midMeters /
         // nearMeters). Server pre-computes these from the road class
         // and profile so a 90 km/h highway fires Far 30 s out (= 750 m)
@@ -735,7 +847,9 @@ public class ScoovaNavLayer private constructor(
     }
 
     /** Helper: voice.say + tick guidance.markSpoke so the silence
-     *  timer never fires right after we already spoke. */
+     *  timer never fires right after we already spoke. Also forwards
+     *  a [CueEvent] to anyone listening on [cueEvents] — the iOS-parity
+     *  telemetry path that [CueTelemetrySender] subscribes to. */
     private fun saySpoken(
         text: String,
         tone: CueTone = CueTone.Normal,
@@ -744,7 +858,20 @@ public class ScoovaNavLayer private constructor(
         if (text.isBlank()) return
         voice.say(text, tone, spatialPan)
         guidance.markSpoke()
+        _cueEvents.tryEmit(
+            CueEvent(
+                tsMs = System.currentTimeMillis(),
+                text = text,
+                tone = tone.name,
+                locale = locale,
+                maneuverIndex = if (maneuvers.isNotEmpty())
+                    latestManeuverIndexForTelemetry else null,
+                metersToManeuver = if (latestMetersToUpcomingManeuver > 0)
+                    latestMetersToUpcomingManeuver else null,
+            )
+        )
     }
+    private var latestManeuverIndexForTelemetry: Int = 0
 
     /** Map a GuidanceEvent to its server phrase + cue tone, then play. */
     private fun handleGuidanceEvent(event: GuidanceEvent, maneuver: ManeuverEvent) {
@@ -804,6 +931,30 @@ public class ScoovaNavLayer private constructor(
             is GuidanceEvent.WrongWayHeading -> "wrongWay"        to CueTone.Alert
             is GuidanceEvent.OffRoute        -> "wrongWay"        to CueTone.Alert
             is GuidanceEvent.AlmostThere     -> almostThereKeyFor(maneuver) to CueTone.Calm
+        }
+
+        // iOS-parity reroute trigger: OffRoute, WrongWayHeading and
+        // (future) MissedTurn each request a fresh route fetch from
+        // the host's routing adapter via [onRerouteNeeded]. Throttled
+        // by [rerouteFetchThrottleMs] (default 8s) so a sustained
+        // off-route condition fires a single reroute, not 30 of them
+        // at GPS tick rate. If the throttle WILL block the fetch,
+        // we also suppress the "Wrong way / Recalculating" cue — the
+        // rider hearing "Recalculating" while nothing actually does
+        // is a perceived lie (iOS comment: Bug H fix).
+        val triggersReroute = event is GuidanceEvent.OffRoute ||
+            event is GuidanceEvent.WrongWayHeading
+        if (triggersReroute) {
+            val nowMs = System.currentTimeMillis()
+            val willBeThrottled = lastRerouteLandedAtMs > 0 &&
+                (nowMs - lastRerouteLandedAtMs) < rerouteFetchThrottleMs
+            if (!willBeThrottled) {
+                rerouteRequestedAtMs = nowMs
+                runCatching { onRerouteNeeded?.invoke() }
+            } else {
+                android.util.Log.d("ScoovaGuidance", "reroute throttled — cue suppressed")
+                return  // don't speak the cue either
+            }
         }
         val phrase = state[key]?.takeIf { it.isNotBlank() } ?: return
         android.util.Log.d("ScoovaGuidance", "fired event=$event → key=$key tone=$tone phrase=$phrase")

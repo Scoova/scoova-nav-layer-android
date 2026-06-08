@@ -5,7 +5,10 @@ import com.scoova.navlayer.core.ManeuverEvent
 import com.scoova.navlayer.core.ManeuverType
 import com.scoova.navlayer.core.ProgressEvent
 import com.scoova.navlayer.core.ScoovaNavLayer
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
@@ -101,6 +104,82 @@ public class ScoovaRoutingAdapter(
     private val maneuverPastPadM: Double = 8.0
 
     /**
+     * Memoised destination + per-trip settings. Set on each successful
+     * [startRoute]; consumed by [rerouteFromHere] when the SDK fires
+     * [ScoovaNavLayer.onRerouteNeeded]. Without memoising these the
+     * SDK couldn't auto-reroute — it knows the rider is off the
+     * polyline but not where they were trying to go. iOS adapter
+     * memoises the same fields (`lastDest`, `lastProfile`, etc.).
+     */
+    private var lastFromOnFirstFetch: LatLon? = null
+    private var lastDest: LatLon? = null
+    private var lastProfile: String = "auto"
+    private var lastLanguage: String = "en-US"
+    private var lastLandmarks: Boolean = true
+    private var lastEyesOff: Boolean = false
+    private var lastAvoidHighways: Boolean = false
+    private var lastAvoidTolls: Boolean = false
+    private var lastAvoidFerries: Boolean = false
+
+    /** Latest rider position fed in by [onLocation] — needed as the
+     *  `from` for an auto-reroute. */
+    private var lastRiderLat: Double = Double.NaN
+    private var lastRiderLon: Double = Double.NaN
+    private var lastRiderBearing: Float? = null
+
+    /** Scope for auto-reroute coroutines. Tied to the adapter's
+     *  lifetime; SupervisorJob so one failed reroute doesn't poison
+     *  the next. */
+    private val rerouteScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+    )
+
+    init {
+        // Wire the SDK's reroute-needed callback to our self-driven
+        // [rerouteFromHere]. iOS does this in the adapter's init too.
+        // The SDK throttles the call already (rerouteFetchThrottleMs),
+        // so this can safely fire-and-forget per event.
+        layer.onRerouteNeeded = {
+            kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+            ).launch {
+                runCatching { rerouteFromHere() }.onFailure {
+                    android.util.Log.w(
+                        "ScoovaRouting",
+                        "auto-reroute failed: ${it.message}",
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Self-driven reroute. Called by the SDK via the [onRerouteNeeded]
+     * callback when the rider drifts off the polyline / faces the
+     * wrong way / misses a turn. Uses the memoised destination + the
+     * latest [onLocation] sample as the new origin, calls [startRoute]
+     * with `isReroute = true` so the SDK suppresses the welcome cue
+     * and updates its reroute throttle. iOS parity for
+     * `rerouteFromHere()` on ScoovaRoutingAdapter.swift.
+     */
+    public suspend fun rerouteFromHere() {
+        val dest = lastDest ?: return
+        if (lastRiderLat.isNaN() || lastRiderLon.isNaN()) return
+        startRoute(
+            from = LatLon(lastRiderLat, lastRiderLon),
+            to = dest,
+            profile = lastProfile,
+            language = lastLanguage,
+            landmarks = lastLandmarks,
+            avoidHighways = lastAvoidHighways,
+            avoidTolls = lastAvoidTolls,
+            avoidFerries = lastAvoidFerries,
+            eyesOff = lastEyesOff,
+            isReroute = true,
+        )
+    }
+
+    /**
      * Fetch a route and start driving the layer. Returns the decoded
      * polyline so the caller can draw it on whatever map they're using.
      */
@@ -122,7 +201,30 @@ public class ScoovaRoutingAdapter(
          * looking-at-the-map mental model.
          */
         eyesOff: Boolean = false,
+        /**
+         * `true` when this is a mid-trip auto-reroute (rider drifted
+         * off the polyline / hit a closure) rather than an initial
+         * planning fetch. iOS parity for the `isReroute` flag on
+         * ScoovaRoutingAdapter.swift line 172. Propagates to
+         * [ScoovaNavLayer.onRoute(_, isReroute:)] so the SDK
+         * suppresses the welcome cue + uses the rerouting trip-state
+         * phrases instead. Adapter-level effect: refreshes the
+         * SDK's [ScoovaNavLayer.onRouteLanded] throttle stamp.
+         */
+        isReroute: Boolean = false,
     ): List<DoubleArray> = withContext(Dispatchers.IO) {
+        // Memoise trip-level settings so [rerouteFromHere] can rebuild
+        // the request without the host passing them again. iOS adapter
+        // does the same on every successful startRoute.
+        lastDest = to
+        if (!isReroute) lastFromOnFirstFetch = from
+        lastProfile = profile
+        lastLanguage = language
+        lastLandmarks = landmarks
+        lastEyesOff = eyesOff
+        lastAvoidHighways = avoidHighways
+        lastAvoidTolls = avoidTolls
+        lastAvoidFerries = avoidFerries
         // Build the per-costing penalty block only when at least one
         // avoid flag is set — keeps the default request body identical
         // to what it was before so caches don't get polluted.
@@ -241,11 +343,23 @@ public class ScoovaRoutingAdapter(
                 nextStreetName = sc?.nextStreetName,
             )
         }
-        layer.onRoute(maneuvers)
+        // iOS parity: reroutes use the (maneuvers, isReroute, eyesOff)
+        // overload so the SDK suppresses the welcome cue + threads
+        // eyes-off mode through to the cue grammar.
+        layer.onRoute(maneuvers, isReroute = isReroute, eyesOff = eyesOff)
         // Pass the decoded polyline so the NavLayer's GuidanceMonitor
         // can project the rider's GPS onto it for drift / off-route /
-        // heading-mismatch detection.
+        // heading-mismatch detection. setRouteShape fires the SDK's
+        // onRouteRefreshed callback so the host redraws the polyline.
         layer.setRouteShape(shape)
+        // Update the SDK's reroute-fetch throttle window so the next
+        // off-route / wrong-way event respects the cooldown.
+        layer.onRouteLanded()
+        // Forward the server's per-route corridor (cross-streets,
+        // ordinals, graph fingerprints, neighbour graph). Null on
+        // legacy responses — reasoner then degrades to lateral-distance
+        // heuristics, identical to iOS.
+        layer.onCorridor(parsed.corridor)
         // Forward the trip-level state phrases (welcome / good /
         // keepGoing / wrongWay / etc.) — the NavLayer reads these when
         // emitting confirmation cues from sensor-fusion turn-detection.
@@ -275,6 +389,13 @@ public class ScoovaRoutingAdapter(
         speedMps: Float? = null,
         bearingDeg: Float? = null,
     ) {
+        // Stash the latest rider sample so [rerouteFromHere] (called
+        // by the SDK's onRerouteNeeded callback) has an origin without
+        // the host having to re-supply it. iOS adapter does the same
+        // via `lastLat` / `lastLon` / `lastBearing`.
+        lastRiderLat = lat
+        lastRiderLon = lon
+        lastRiderBearing = bearingDeg
         if (maneuvers.isEmpty() || shape.isEmpty()) return
         // currentManeuverIdx is the index of the LAST maneuver the
         // rider has already reached or passed (-1 = haven't reached

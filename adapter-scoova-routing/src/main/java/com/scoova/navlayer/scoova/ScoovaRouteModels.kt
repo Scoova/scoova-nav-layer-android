@@ -56,7 +56,16 @@ internal data class CostingPenalties(
 @Serializable public data class LatLon(val lat: Double, val lon: Double)
 
 @Serializable
-internal data class RouteResponse(val trip: Trip? = null)
+internal data class RouteResponse(
+    val trip: Trip? = null,
+    /**
+     * Versioned per-route data the on-device guidance reasoner reads
+     * (cross-streets, ordinals, graph fingerprints, neighbour graph).
+     * Optional — legacy servers don't emit it and the SDK falls back
+     * to the baked-string voice path. Mirrors iOS' `corridor` block.
+     */
+    val corridor: com.scoova.navlayer.core.Corridor? = null,
+)
 
 @Serializable
 internal data class Trip(
