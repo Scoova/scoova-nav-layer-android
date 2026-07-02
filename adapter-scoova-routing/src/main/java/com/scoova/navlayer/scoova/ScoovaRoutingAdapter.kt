@@ -101,7 +101,21 @@ public class ScoovaRoutingAdapter(
      * later vertex". 8 m matches typical urban-block centerline
      * resolution.
      */
-    private val maneuverPastPadM: Double = 8.0
+    // 25 m — wide enough that a single noisy GPS sample at startup
+    // (urban canyon, AOA bias, emulator quantisation) can't project
+    // past a maneuver whose anchor is only 10–20 m down the polyline.
+    // The previous 8 m pad caused riders standing at the start of a
+    // route with a 15 m first turn to skip straight to "next maneuver"
+    // — the SDK would then voice "6 km to next turn" while the banner
+    // (driven by the same index) also pointed 6 km away. iOS uses an
+    // equivalent guard via its `recentProgressBand` heuristic.
+    private val maneuverPastPadM: Double = 25.0
+
+    /** Don't declare a maneuver "passed" while the rider is still this
+     *  close to its anchor by straight-line distance. Protects against
+     *  the projection snapping forward when the rider hasn't actually
+     *  moved (start-of-route GPS jitter, parallel street snap). */
+    private val maneuverPastMinStraightLineM: Double = 25.0
 
     /**
      * Memoised destination + per-trip settings. Set on each successful
@@ -343,6 +357,21 @@ public class ScoovaRoutingAdapter(
                 nextStreetName = sc?.nextStreetName,
             )
         }
+        // Diagnostic: log the negotiated voice-mode + the first three
+        // maneuvers' far cues so the rider can verify (adb logcat |
+        // grep ScoovaVoiceMode) that the eyes-off flag is reaching
+        // the server and that the server's mode-aware variants are
+        // being honoured. Keep in production until the eye-on-the-
+        // road grammar is verified end-to-end on real devices.
+        runCatching {
+            val first3 = maneuvers.take(3).joinToString(" | ") {
+                "[${it.voiceFar?.take(80) ?: "—"}]"
+            }
+            android.util.Log.i(
+                "ScoovaVoiceMode",
+                "eyesOff=$eyesOff isReroute=$isReroute lang=$language welcomeFull=[${trip.scoova?.welcomeFull?.take(120) ?: "—"}] mnv-far: $first3",
+            )
+        }
         // iOS parity: reroutes use the (maneuvers, isReroute, eyesOff)
         // overload so the SDK suppresses the welcome cue + threads
         // eyes-off mode through to the cue grammar.
@@ -470,6 +499,17 @@ public class ScoovaRoutingAdapter(
         while (idx + 1 < maneuverProgressM.size &&
             riderProgressM >= maneuverProgressM[idx + 1] + maneuverPastPadM
         ) {
+            // Safety guard: even if the projection says we're past the
+            // maneuver, refuse to skip it while the rider is still
+            // physically inside its arrival zone. Without this, a
+            // projection snap at startup advances the index off the
+            // first short segment and the cue + banner jump to the
+            // next maneuver several km away.
+            val next = maneuvers.getOrNull(idx + 1)
+            if (next != null) {
+                val straight = GeoMath.haversineMeters(lat, lon, next.latitude, next.longitude)
+                if (straight < maneuverPastMinStraightLineM) break
+            }
             idx++
         }
         return idx

@@ -253,6 +253,19 @@ public class ScoovaNavLayer private constructor(
     private var lastWelcomedAtMs: Long = 0L
 
     /**
+     * Reset per-trip welcome state so the next [onRoute] / [onProgress]
+     * speaks a fresh welcome cue regardless of how recently the last
+     * one fired. Hosts that keep the layer alive across nav sessions
+     * (warm-TTS pattern) must call this from their stopNav so the 60 s
+     * backup throttle doesn't silently suppress the welcome on a
+     * second back-to-back trip.
+     */
+    public fun clearWelcomeThrottle() {
+        welcomedRouteHash = 0
+        lastWelcomedAtMs = 0L
+    }
+
+    /**
      * Host callback fired when the SDK decides a reroute is needed
      * (OffRoute, WrongWayHeading, or MissedTurn event past throttle).
      * The host's routing adapter listens and refetches the route from
@@ -688,6 +701,17 @@ public class ScoovaNavLayer private constructor(
         val idx = p.upcomingManeuverIndex.coerceIn(0, maneuvers.lastIndex)
         val maneuver = maneuvers[idx]
         latestManeuverIndexForTelemetry = idx
+        // Diagnostic: every progress tick, log the SDK's view of where
+        // the rider is in the maneuver list. Compare against the
+        // rider's visual sense of "next turn" — if dist is wildly
+        // larger than what the banner / driving view shows, either
+        // the server's list omits a small maneuver (case A — voice
+        // correctly skips it) or the polyline projection ran past
+        // the real next maneuver (case B — advanceCurrentIndex bug).
+        android.util.Log.v(
+            "NavProgress",
+            "tick: idx=$idx/${maneuvers.lastIndex} distM=${p.metersToUpcomingManeuver.toInt()} totalM=${p.metersRemaining}",
+        )
         // Per-maneuver thresholds from the server (farMeters / midMeters /
         // nearMeters). Server pre-computes these from the road class
         // and profile so a 90 km/h highway fires Far 30 s out (= 750 m)
@@ -891,14 +915,24 @@ public class ScoovaNavLayer private constructor(
                 .firstOrNull { it.isNotBlank() }
             if (base != null) {
                 // Distance-to-next-turn so the voice matches the banner.
-                // Falls back to total remaining when there's no next
-                // turn (very short trip / arrival imminent) so the
-                // rider isn't told "0 metres to the next turn."
-                val metersForClause = if (latestMetersToUpcomingManeuver > 0)
-                    latestMetersToUpcomingManeuver
-                else latestMetersRemaining
-                val phrase = appendDistanceToNextTurn(
-                    base, locale, metersForClause)
+                // When the rider's polyline projection is sitting ON
+                // the upcoming maneuver vertex, metersToUpcomingManeuver
+                // is 0 — that means the rider IS at the turn, not that
+                // there's no next turn. Speak just the base phrase
+                // ("You're on track.") and let the approach cues own
+                // the urgency. The earlier code fell back to the total
+                // remaining distance here, which leaked the whole 6 km
+                // route length into a reaffirm clause ("6 km to the
+                // next turn") whenever projection snapped to a vertex.
+                val phrase = if (latestMetersToUpcomingManeuver > 0) {
+                    appendDistanceToNextTurn(base, locale, latestMetersToUpcomingManeuver)
+                } else {
+                    base
+                }
+                android.util.Log.i(
+                    "NavCue",
+                    "KeepGoing cue: idxToManeuver=$latestMetersToUpcomingManeuver totalRem=$latestMetersRemaining → phrase=[${phrase.take(80)}]",
+                )
                 saySpoken(phrase, CueTone.Calm)
                 _guidanceCues.tryEmit(GuidanceCue(
                     tsMs = System.currentTimeMillis(),
