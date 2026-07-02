@@ -9,7 +9,7 @@ plugins {
 
 allprojects {
     group = "com.scoova"
-    version = "1.0.0"
+    version = "1.0.1"
 }
 
 // SDK publishing — applies to every module with the `maven-publish` plugin.
